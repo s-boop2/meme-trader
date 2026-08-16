@@ -3,6 +3,7 @@ import os
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from backend.engine import PaperEngine
+from backend.discord_notifier import DiscordNotifier
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,19 +35,37 @@ async def main():
     logger.info(f"✅ Paper Trading Engine started!")
     logger.info(f"💰 Starting Balance: ${balance:.2f}")
     logger.info(f"📊 Max Positions: {settings['max_positions']}")
-    logger.info(f"🎯 Stop Loss: {settings['stop_loss_pct']}%")
+    logger.info(f"🛑 Stop Loss: {settings['stop_loss_pct']}%")
     logger.info(f"📈 TP1: +{settings['tp1_pct']}% | TP2: +{settings['tp2_pct']}%")
     logger.info(f"🤖 AI Filter: {'ENABLED' if settings['ai_filter_enabled'] else 'DISABLED'}")
+    logger.info(f"🔗 Discord: {'CONNECTED ✅' if engine.notifier.enabled else 'DISABLED ⚠️'}")
     logger.info(f"\n🔄 Starting monitor loop (interval={20}s)...\n")
+    
+    # Send startup notification
+    await engine.notifier.send_embed(
+        title="🤖 Meme Trader Bot Started",
+        description="Paper Trading Engine is now running",
+        fields={
+            "Balance": f"${balance:.2f}",
+            "Max Positions": str(settings['max_positions']),
+            "Stop Loss": f"{settings['stop_loss_pct']}%",
+        }
+    )
     
     # Start monitoring loop
     try:
         await engine.monitor_loop(interval=20)
     except KeyboardInterrupt:
         logger.info("\n⏹️  Bot stopped by user")
+        await engine.notifier.send_embed(
+            title="⏹️ Meme Trader Bot Stopped",
+            description="Paper trading session ended"
+        )
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}", exc_info=True)
+        await engine.notifier.notify_error("Fatal Bot Error", str(e))
     finally:
+        await engine.notifier.stop()
         client.close()
         logger.info("🔌 Database connection closed")
 

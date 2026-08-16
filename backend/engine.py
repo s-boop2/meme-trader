@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError, OperationFailure
+from backend.discord_notifier import DiscordNotifier, NotificationType
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +56,16 @@ class PaperEngine:
         self._execution_cache = {}
         self._price_cache = {}
         self._price_cache_ttl = 5  # seconds
+        self.notifier = DiscordNotifier()
         logger.info(f"PaperEngine initialized (max_retries={max_retries})")
 
     # ---------- INITIALIZATION & SETUP ----------
     async def initialize(self):
         """Initialize database indexes for optimal performance"""
         try:
+            # Initialize Discord notifier
+            await self.notifier.start()
+            
             # Create compound indexes for faster queries
             await self.db.positions.create_index([("mint", 1), ("status", 1)])
             await self.db.positions.create_index([("status", 1), ("created_at", -1)])
@@ -253,14 +258,24 @@ class PaperEngine:
                 await self.db.trades.insert_one(trade_doc)
 
                 await self.log(f"OPEN {symbol} @ ${fill_price:.12f}", "info")
+                
+                # Send Discord notification
+                await self.notifier.notify_position_open(
+                    symbol=symbol,
+                    entry_price=fill_price,
+                    amount=net_amount,
+                    invested_usd=buy_size
+                )
+                
                 return {"ok": True, "position_id": position_id, "price": fill_price}
 
             except Exception as e:
                 logger.error(f"Error opening position: {e}")
+                await self.notifier.notify_error("Position Open Failed", str(e))
                 return {"ok": False, "reason": str(e)}
 
     # ---------- CLOSE POSITION ----------
-    async def close_position(self, position_id: str, portion_pct: float = 100.0) -> Dict:
+    async def close_position(self, position_id: str, portion_pct: float = 100.0, reason: str = "Manual Close") -> Dict:
         """Close a position"""
         async with self._lock:
             try:
@@ -324,6 +339,16 @@ class PaperEngine:
                 await self.db.trades.insert_one(trade_doc)
 
                 await self.log(f"CLOSE {pos_doc['symbol']} | PnL ${pnl:+.2f}")
+                
+                # Send Discord notification
+                await self.notifier.notify_position_close(
+                    symbol=pos_doc["symbol"],
+                    exit_price=fill_price,
+                    pnl_usd=pnl,
+                    pnl_pct=pnl_pct,
+                    reason=reason
+                )
+                
                 return {
                     "ok": True,
                     "pnl": round(pnl, 4),
@@ -333,6 +358,7 @@ class PaperEngine:
 
             except Exception as e:
                 logger.error(f"Error closing position: {e}")
+                await self.notifier.notify_error("Position Close Failed", str(e))
                 return {"ok": False, "reason": str(e)}
 
     # ---------- MONITORING ----------
@@ -348,10 +374,10 @@ class PaperEngine:
                     change_pct = random.uniform(-15, 50)  # Simulate price changes
                     
                     if change_pct <= s["stop_loss_pct"]:
-                        result = await self.close_position(str(doc["_id"]), 100)
+                        result = await self.close_position(str(doc["_id"]), 100, reason="Stop Loss")
                         actions.append(result)
                     elif change_pct >= s["tp1_pct"] and not doc.get("tp1_hit"):
-                        result = await self.close_position(str(doc["_id"]), s["tp1_sell_pct"])
+                        result = await self.close_position(str(doc["_id"]), s["tp1_sell_pct"], reason="Take Profit 1")
                         actions.append(result)
 
                 except Exception as e:
@@ -361,6 +387,24 @@ class PaperEngine:
         except Exception as e:
             logger.error(f"Error in check_positions: {e}")
             return actions
+
+    async def send_status_update(self):
+        """Send periodic status update to Discord"""
+        try:
+            balance = await self.balance()
+            open_count = await self.db.positions.count_documents({"status": "open"})
+            
+            # Calculate total PnL
+            positions = await self.db.positions.find({"status": "closed"}).to_list(None)
+            total_pnl = sum(pos.get("realized_pnl", 0.0) for pos in positions)
+            
+            await self.notifier.notify_status(
+                balance=balance,
+                open_positions=open_count,
+                total_pnl=total_pnl
+            )
+        except Exception as e:
+            logger.error(f"Error sending status update: {e}")
 
     async def monitor_loop(self, interval: int = 20):
         """Main monitoring loop"""
@@ -373,10 +417,16 @@ class PaperEngine:
                 if not s["bot_paused"]:
                     check_count += 1
                     actions = await self.check_positions()
+                    
+                    # Send status update every 10 checks
+                    if check_count % 10 == 0:
+                        await self.send_status_update()
+                    
                     if actions:
                         successful = sum(1 for a in actions if a.get("ok"))
                         logger.info(f"Check #{check_count}: {successful}/{len(actions)} actions")
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
+                await self.notifier.notify_error("Monitor Loop Error", str(e))
 
             await asyncio.sleep(interval)
