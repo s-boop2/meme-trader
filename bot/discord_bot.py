@@ -8,6 +8,7 @@ from typing import Optional, Dict
 import os
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+from backend.discord_notifier import DiscordNotifier, NotificationType
 
 load_dotenv()
 
@@ -30,14 +31,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Global state
 db = None
+notifier = None
 
 
 class TradingCog(commands.Cog):
-    """Trading commands cog"""
+    """Trading commands cog with Discord + Webhook integration"""
     
     def __init__(self, bot):
         self.bot = bot
         self.db = None
+        self.notifier = None
     
     @app_commands.command(name="balance", description="Check your trading balance")
     async def balance_cmd(self, interaction: discord.Interaction):
@@ -106,6 +109,7 @@ class TradingCog(commands.Cog):
             # Get engine instance
             from backend.engine import PaperEngine
             engine = PaperEngine(self.db)
+            engine.notifier = self.notifier  # Use shared notifier
             
             result = await engine.open_position(mint, symbol.upper())
             
@@ -141,6 +145,7 @@ class TradingCog(commands.Cog):
             
             from backend.engine import PaperEngine
             engine = PaperEngine(self.db)
+            engine.notifier = self.notifier  # Use shared notifier
             
             result = await engine.close_position(position_id)
             
@@ -198,6 +203,42 @@ class TradingCog(commands.Cog):
             logger.error(f"Error getting settings: {e}")
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
     
+    @app_commands.command(name="stats", description="View trading statistics")
+    async def stats_cmd(self, interaction: discord.Interaction):
+        """Get trading statistics"""
+        try:
+            balance = await self.db.wallet.find_one({"key": "global"})
+            current_balance = float(balance["balance"]) if balance else 1000.0
+            
+            settings = await self.db.settings.find_one({"key": "global"})
+            starting_balance = settings["starting_capital"] if settings else 1000.0
+            
+            closed_positions = await self.db.positions.find({"status": "closed"}).to_list(None)
+            total_pnl = sum(pos.get("realized_pnl", 0.0) for pos in closed_positions)
+            pnl_pct = (total_pnl / starting_balance * 100) if starting_balance > 0 else 0.0
+            
+            win_count = sum(1 for pos in closed_positions if pos.get("realized_pnl", 0.0) >= 0)
+            total_trades = len(closed_positions)
+            win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0.0
+            
+            embed = discord.Embed(
+                title="📈 Trading Statistics",
+                color=discord.Color.blurple(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.add_field(name="Starting Balance", value=f"${starting_balance:,.2f}", inline=True)
+            embed.add_field(name="Current Balance", value=f"${current_balance:,.2f}", inline=True)
+            embed.add_field(name="Total P&L", value=f"${total_pnl:+,.2f}", inline=True)
+            embed.add_field(name="P&L %", value=f"{pnl_pct:+.2f}%", inline=True)
+            embed.add_field(name="Total Trades", value=str(total_trades), inline=True)
+            embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
+            embed.set_footer(text="🤖 Meme Trader Bot")
+            
+            await interaction.response.send_message(embed=embed)
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+    
     @app_commands.command(name="help", description="Show help menu")
     async def help_cmd(self, interaction: discord.Interaction):
         """Show help"""
@@ -212,6 +253,7 @@ class TradingCog(commands.Cog):
         embed.add_field(name="📈 /open", value="Open a new trading position", inline=False)
         embed.add_field(name="📉 /close", value="Close a position", inline=False)
         embed.add_field(name="⚙️ /settings", value="View trading settings", inline=False)
+        embed.add_field(name="📊 /stats", value="View trading statistics", inline=False)
         embed.add_field(name="❓ /help", value="Show this help menu", inline=False)
         embed.set_footer(text="🤖 Meme Trader Bot")
         
@@ -245,20 +287,41 @@ async def on_ready():
 
 async def main():
     """Main bot initialization"""
-    global db
+    global db, notifier
     
     # Initialize MongoDB
+    logger.info(f"📡 Connecting to MongoDB: {MONGODB_URI}")
     client = AsyncIOMotorClient(MONGODB_URI)
     db = client["meme_trader"]
+    
+    # Initialize Discord Notifier
+    notifier = DiscordNotifier()
+    await notifier.start()
     
     # Add cog
     cog = TradingCog(bot)
     cog.db = db
+    cog.notifier = notifier
     await bot.add_cog(cog)
     
-    logger.info("🚀 Starting Discord Trading Bot...")
+    logger.info("="*50)
+    logger.info("🚀 MEME TRADER BOT STARTING")
+    logger.info("="*50)
     logger.info(f"📡 MongoDB: {MONGODB_URI}")
-    logger.info(f"💬 Discord Token: {'✅' if DISCORD_TOKEN else '❌'}")
+    logger.info(f"🤖 Discord Bot: {'✅ ENABLED' if DISCORD_TOKEN else '❌ DISABLED'}")
+    logger.info(f"🪝 Webhook: {'✅ ENABLED' if notifier.enabled else '❌ DISABLED'}")
+    logger.info(f"🔧 Guild ID: {GUILD_ID if GUILD_ID else 'GLOBAL'}")
+    logger.info("="*50)
+    
+    # Send startup notification
+    await notifier.send_embed(
+        title="🚀 Meme Trader Bot Started",
+        description="Discord trading bot is now online",
+        fields={
+            "Status": "✅ Running",
+            "Mode": "Paper Trading",
+        }
+    )
     
     async with bot:
         await bot.start(DISCORD_TOKEN)
@@ -268,4 +331,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("👋 Bot stopped by user")
+        logger.info("\n👋 Bot stopped by user")
+    except Exception as e:
+        logger.error(f"\n❌ Fatal error: {e}", exc_info=True)
